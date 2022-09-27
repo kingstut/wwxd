@@ -6,10 +6,17 @@ import requests
 import os
 import re
 import random
-
+import numpy as np 
+import torch
+#torch.set_default_tensor_type(torch.cuda.FloatTensor)
+torch.cuda.empty_cache()
+#global var 
 ALLOW_NEW_LINES = False    
 LEARNING_RATE = 1.372e-4
 EPOCHS = 4
+TRAINER = None 
+PRE_ENCODED = None
+HANDLE = None 
 
 #adapted from https://github.com/borisdayma/huggingtweets/blob/master/huggingtweets-demo.ipynb
 def fix_text(text):
@@ -42,12 +49,14 @@ def get_data(handle):
     res = http.request("GET", f"http://us-central1-huggingtweets.cloudfunctions.net/get_tweets?handle={handle}&force=1")
     res = json.loads(res.data.decode('utf-8'))
 
+    print(res)
+
     all_tweets = res['tweets']
     curated_tweets = [fix_text(tweet) for tweet in all_tweets]
-
+    cool_tweets = []
     # create dataset
     clean_tweets = [clean_tweet(tweet) for tweet in curated_tweets]
-    cool_tweets = [tweet for tweet in clean_tweets if not boring_tweet(tweet)]
+    cool_tweets.append([tweet for tweet in clean_tweets if not boring_tweet(tweet)])
 
     # create a file based on multiple epochs with tweets mixed up
     seed_data = random.randint(0,2**32-1)
@@ -82,10 +91,11 @@ def finetune(handle):
 
     # Setting up pre-trained neural network
     global trainer
-    tokenizer = AutoTokenizer.from_pretrained('gpt3')
-    model = AutoModelForCausalLM.from_pretrained('gpt3', cache_dir=pathlib.Path('cache').resolve())
-    block_size = tokenizer.model_max_length
+    tokenizer = AutoTokenizer.from_pretrained("bigscience/bloom-560m")
+    model = AutoModelForCausalLM.from_pretrained("bigscience/bloom-560m", use_cache=True)
+    block_size = 64 #tokenizer.model_max_length
     train_dataset = TextDataset(tokenizer=tokenizer, file_path=f"data_{'-'.join(handle)}_train.txt", block_size=block_size, overwrite_cache=True)
+    print("dataset", len(train_dataset))
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     seed = random.randint(0,2**32-1)
 
@@ -107,7 +117,7 @@ def finetune(handle):
                     args=training_args,
                     data_collator=data_collator,
                     train_dataset=train_dataset)
-                
+      
     # Update lr scheduler
     train_dataloader = trainer.get_train_dataloader()
     num_train_steps = len(train_dataloader)
@@ -118,7 +128,7 @@ def finetune(handle):
         num_training_steps=num_train_steps)
 
     trainer.train()
-
+    """
     trainer.model.config.task_specific_params['text-generation'] = {
         'do_sample': True,
         'min_length': 10,
@@ -126,14 +136,16 @@ def finetune(handle):
         'temperature': 1.,
         'top_p': 0.95,
         'prefix': '<|endoftext|>'}
-
+    """
     model_name = '-'.join(handle)
     trainer.save_model(model_name)
     return trainer 
 
-def predict(start, trainer):
-    start_with_bos = '<|endoftext|>' + start
+def predict(query, trainer, pre_encoded=None):
+    start_with_bos = '<|endoftext|>' + query
     encoded_prompt = trainer.tokenizer(start_with_bos, add_special_tokens=False, return_tensors="pt").input_ids
+    if pre_encoded:
+        encoded_prompt = torch.cat((pre_encoded, encoded_prompt))
     encoded_prompt = encoded_prompt.to(trainer.model.device)
 
     # prediction
@@ -159,5 +171,42 @@ def predict(start, trainer):
 
     predictions = []
     for i, g in enumerate(generated_sequences):
-        predictions.append([start, g])
-    return predictions
+        predictions.append([query, g])
+    return predictions, encoded_prompt
+
+def get_encoding(reply, trainer):
+    start_with_bos = '<|endoftext|>' + reply
+    encoded_prompt = trainer.tokenizer(start_with_bos, add_special_tokens=False, return_tensors="pt").input_ids
+    encoded_prompt = encoded_prompt.to(trainer.model.device)
+    return encoded_prompt 
+
+def start(handle, chat_history = False):
+    HANDLE = handle 
+    get_data(handle)
+    trainer = finetune(handle)
+    TRAINER = trainer 
+
+    if chat_history: 
+        PRE_ENCODED = torch.load(chat_history)
+        return 
+    init_prompt = f"""You are {handle}. A conversation with me looks like this:  
+    Me: says something
+    {handle}: responds
+    For every Me: input you have to generate a response from {handle}:
+    Me: Hi, I would like to have a conversation with you.
+    {handle}: Sure, let's have a conversation. 
+    Me: Can I ask you a question?
+    {handle}:"""
+
+    reply, PRE_ENCODED = predict(init_prompt, TRAINER)
+    PRE_ENCODED = torch.cat((PRE_ENCODED, get_encoding(reply+"\n", TRAINER)))
+
+
+def get_reply(query):
+    if str.to_lower(query) == "end conversation":
+        torch.save(PRE_ENCODED, "chat_history.pt")
+        return 
+    query = "Me:" + query + "\n" + HANDLE + ":"
+    reply, PRE_ENCODED = predict(query, TRAINER, PRE_ENCODED)
+    PRE_ENCODED = torch.cat((PRE_ENCODED, get_encoding(reply+"\n", TRAINER)))
+    print(reply)
